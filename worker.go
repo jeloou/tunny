@@ -24,16 +24,34 @@ package tunny
 
 // workRequest is a struct containing context representing a workers intention
 // to receive a work payload.
+type request interface {
+	getPayload() interface{}
+}
+
 type workRequest struct {
-	// jobChan is used to send the payload to this worker.
-	jobChan chan<- interface{}
+	payload interface{}
 
 	// retChan is used to read the result from this worker.
-	retChan <-chan interface{}
+	retChan chan<- interface{}
 
 	// interruptFunc can be called to cancel a running job. When called it is no
 	// longer necessary to read from retChan.
 	interruptFunc func()
+}
+
+func (r *workRequest) getPayload() interface{} {
+	return r.payload
+}
+
+type processRequest struct {
+	workRequest
+
+	// retChan is used to read the result from this worker.
+	retChan chan<- interface{}
+}
+
+type runRequest struct {
+	workRequest
 }
 
 //------------------------------------------------------------------------------
@@ -46,7 +64,9 @@ type workerWrapper struct {
 	interruptChan chan struct{}
 
 	// reqChan is NOT owned by this type, it is used to send requests for work.
-	reqChan chan<- workRequest
+	reqChan chan request
+
+	workersChan chan chan request
 
 	// closeChan can be closed in order to cleanly shutdown this worker.
 	closeChan chan struct{}
@@ -56,18 +76,20 @@ type workerWrapper struct {
 }
 
 func newWorkerWrapper(
-	reqChan chan<- workRequest,
+	workersChan chan chan request,
 	worker Worker,
+	i int,
 ) *workerWrapper {
 	w := workerWrapper{
 		worker:        worker,
 		interruptChan: make(chan struct{}),
-		reqChan:       reqChan,
+		workersChan:   workersChan,
+		reqChan:       make(chan request),
 		closeChan:     make(chan struct{}),
 		closedChan:    make(chan struct{}),
 	}
 
-	go w.run()
+	go w.run(i)
 
 	return &w
 }
@@ -79,37 +101,39 @@ func (w *workerWrapper) interrupt() {
 	w.worker.Interrupt()
 }
 
-func (w *workerWrapper) run() {
-	jobChan, retChan := make(chan interface{}), make(chan interface{})
+func (w *workerWrapper) run(i int) {
 	defer func() {
 		w.worker.Terminate()
-		close(retChan)
 		close(w.closedChan)
 	}()
 
 	for {
 		// NOTE: Blocking here will prevent the worker from closing down.
 		w.worker.BlockUntilReady()
+
 		select {
-		case w.reqChan <- workRequest{
-			jobChan:       jobChan,
-			retChan:       retChan,
-			interruptFunc: w.interrupt,
-		}:
+		case w.workersChan <- w.reqChan:
 			select {
-			case payload := <-jobChan:
-				result := w.worker.Process(payload)
-				select {
-				case retChan <- result:
-				case <-w.interruptChan:
-					w.interruptChan = make(chan struct{})
+			case req := <-w.reqChan:
+				switch req.(type) {
+				case *runRequest:
+					w.worker.Run(req.getPayload())
+				case *processRequest:
+					processReq := req.(*processRequest)
+					res := w.worker.Process(processReq.getPayload())
+					select {
+					case processReq.retChan <- res:
+					case <-w.interruptChan:
+						w.interruptChan = make(chan struct{})
+					}
 				}
-			case _, _ = <-w.interruptChan:
+			case <-w.interruptChan:
 				w.interruptChan = make(chan struct{})
 			}
 		case <-w.closeChan:
 			return
 		}
+
 	}
 }
 

@@ -48,6 +48,8 @@ type Worker interface {
 	// Process will synchronously perform a job and return the result.
 	Process(interface{}) interface{}
 
+	Run(interface{})
+
 	// BlockUntilReady is called before each job is processed and must block the
 	// calling goroutine until the Worker is ready to process the next job.
 	BlockUntilReady()
@@ -67,10 +69,15 @@ type Worker interface {
 // func(interface{}) interface{}
 type closureWorker struct {
 	processor func(interface{}) interface{}
+	runner    func(interface{})
 }
 
 func (w *closureWorker) Process(payload interface{}) interface{} {
 	return w.processor(payload)
+}
+
+func (w *closureWorker) Run(payload interface{}) {
+	w.runner(payload)
 }
 
 func (w *closureWorker) BlockUntilReady() {}
@@ -93,9 +100,10 @@ func (w *callbackWorker) Process(payload interface{}) interface{} {
 	return nil
 }
 
-func (w *callbackWorker) BlockUntilReady() {}
-func (w *callbackWorker) Interrupt()       {}
-func (w *callbackWorker) Terminate()       {}
+func (w *callbackWorker) Run(payload interface{}) {}
+func (w *callbackWorker) BlockUntilReady()        {}
+func (w *callbackWorker) Interrupt()              {}
+func (w *callbackWorker) Terminate()              {}
 
 //------------------------------------------------------------------------------
 
@@ -103,9 +111,9 @@ func (w *callbackWorker) Terminate()       {}
 // goroutine. The Pool can initialize, expand, compress and close the workers,
 // as well as processing jobs with the workers synchronously.
 type Pool struct {
-	ctor    func() Worker
-	workers []*workerWrapper
-	reqChan chan workRequest
+	ctor        func() Worker
+	workers     []*workerWrapper
+	workersChan chan chan request
 
 	workerMut  sync.Mutex
 	queuedJobs int64
@@ -117,8 +125,8 @@ type Pool struct {
 // Worker.
 func New(n int, ctor func() Worker) *Pool {
 	p := &Pool{
-		ctor:    ctor,
-		reqChan: make(chan workRequest),
+		workersChan: make(chan chan request),
+		ctor:        ctor,
 	}
 	p.SetSize(n)
 
@@ -151,40 +159,63 @@ func NewCallback(n int) *Pool {
 func (p *Pool) Process(payload interface{}) interface{} {
 	atomic.AddInt64(&p.queuedJobs, 1)
 
-	request, open := <-p.reqChan
+	worker, open := <-p.workersChan
 	if !open {
 		panic(ErrPoolNotRunning)
 	}
 
-	request.jobChan <- payload
+	retChan := make(chan interface{})
+	worker <- &processRequest{
+		workRequest{
+			payload: payload,
+		},
+		retChan,
+	}
 
-	payload, open = <-request.retChan
+	res, open := <-retChan
 	if !open {
 		panic(ErrWorkerClosed)
 	}
 
 	atomic.AddInt64(&p.queuedJobs, -1)
-	return payload
+	return res
+}
+
+// Run will use the Pool to process a payload asynchronously and ignore the
+// result. Run can be called safely by any goroutines, but will panic if the
+// Pool has been stopped.
+func (p *Pool) Run(payload interface{}) {
+	atomic.AddInt64(&p.queuedJobs, 1)
+
+	worker, open := <-p.workersChan
+	if !open {
+		panic(ErrPoolNotRunning)
+	}
+
+	worker <- &runRequest{
+		workRequest{
+			payload: payload,
+		},
+	}
+
+	atomic.AddInt64(&p.queuedJobs, -1)
 }
 
 // ProcessTimed will use the Pool to process a payload and synchronously return
 // the result. If the timeout occurs before the job has finished the worker will
 // be interrupted and ErrJobTimedOut will be returned. ProcessTimed can be
 // called safely by any goroutines.
-func (p *Pool) ProcessTimed(
-	payload interface{},
-	timeout time.Duration,
-) (interface{}, error) {
+func (p *Pool) ProcessTimed(payload interface{}, timeout time.Duration) (interface{}, error) {
 	atomic.AddInt64(&p.queuedJobs, 1)
 	defer atomic.AddInt64(&p.queuedJobs, -1)
 
 	tout := time.NewTimer(timeout)
 
-	var request workRequest
+	var worker chan request
 	var open bool
 
 	select {
-	case request, open = <-p.reqChan:
+	case worker, open = <-p.workersChan:
 		if !open {
 			return nil, ErrPoolNotRunning
 		}
@@ -192,25 +223,38 @@ func (p *Pool) ProcessTimed(
 		return nil, ErrJobTimedOut
 	}
 
-	select {
-	case request.jobChan <- payload:
-	case <-tout.C:
-		request.interruptFunc()
-		return nil, ErrJobTimedOut
+	retChan := make(chan interface{})
+	req := &processRequest{
+		workRequest{
+			payload: payload,
+		},
+		retChan,
 	}
 
 	select {
-	case payload, open = <-request.retChan:
+	case worker <- req:
+	case <-tout.C:
+		req.interruptFunc()
+		return nil, ErrJobTimedOut
+	}
+
+	if !open {
+		panic(ErrWorkerClosed)
+	}
+
+	var res interface{}
+	select {
+	case res, open = <-retChan:
 		if !open {
 			return nil, ErrWorkerClosed
 		}
 	case <-tout.C:
-		request.interruptFunc()
+		req.interruptFunc()
 		return nil, ErrJobTimedOut
 	}
 
 	tout.Stop()
-	return payload, nil
+	return res, nil
 }
 
 // QueueLength returns the current count of pending queued jobs.
@@ -232,7 +276,7 @@ func (p *Pool) SetSize(n int) {
 
 	// Add extra workers if N > len(workers)
 	for i := lWorkers; i < n; i++ {
-		p.workers = append(p.workers, newWorkerWrapper(p.reqChan, p.ctor()))
+		p.workers = append(p.workers, newWorkerWrapper(p.workersChan, p.ctor(), i))
 	}
 
 	// Asynchronously stop all workers > N
@@ -260,7 +304,7 @@ func (p *Pool) GetSize() int {
 // Close will terminate all workers and close the job channel of this Pool.
 func (p *Pool) Close() {
 	p.SetSize(0)
-	close(p.reqChan)
+	close(p.workersChan)
 }
 
 //------------------------------------------------------------------------------
